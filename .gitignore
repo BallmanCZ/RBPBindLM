@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Training artifacts
+results/
+code/
+code/results/
+code/OSS为基础确定特征提取方法/results/
+model/
+*.h5
+*.keras
+*.ckpt
+*.weights.h5
+
+# Temporary analysis outputs
+*.npy
+*.npz
+*.log
+
+# Large model caches
+.cache/
+hf_cache/
+
+# Duplicated nested data copies
+code/OSS为基础确定特征提取方法/datasets/
+
+# Keep compressed dataset files only
+datasets/**/sequences.fa
+datasets/**/sequences.fasta
+datasets/**/structure
