@@ -45,13 +45,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 STOP_AFTER_FIRST_FOLD = False
 
-PAPER_SN_SP_TARGETS = {
-    "1_PARCLIP_AGO1234_hg19": {"SN": 0.592, "SP": 0.7873},
-}
-
-TARGET_WEIGHT_SN = 3.0
-TARGET_WEIGHT_SP = 1.0
-TOPK_BY_COST = 20
+# Declared before any validation/test labels are observed.
+CLASSIFICATION_THRESHOLD = 0.5
+PROTOCOL_VERSION = "train_fold_ksu_fixed_threshold_v2"
 
 SEQ_MODEL_NAME = GENA_MODEL_NAME
 SEQ_BATCH_SIZE = 64
@@ -149,67 +145,50 @@ def _deterministic_ksu(seq_pooled, seq_embeddings, seq_mask, struc_array, labels
         random_state=SEED,
     )
     indices = np.asarray(indices)
+    if (indices.ndim != 1 or indices.dtype.kind not in "iu"
+            or len(np.unique(indices)) != len(indices)
+            or np.any(indices < 0) or np.any(indices >= len(labels))):
+        raise ValueError("KSU returned invalid local sample indices")
+    if not np.array_equal(label_resampled, np.asarray(labels)[indices]):
+        raise ValueError("KSU labels do not match returned sample indices")
+    if not np.array_equal(seq_resampled, seq_pooled[indices]):
+        raise ValueError("KSU features do not match returned sample indices")
     order = np.argsort(indices, kind="mergesort")
     indices = indices[order]
     seq_resampled = seq_resampled[order]
     label_resampled = np.asarray(label_resampled)[order]
     return {
-        "seq_pooled": seq_resampled.astype(np.float32),
+        "seq_pooled": seq_pooled[indices].astype(np.float32),
         "seq_embeddings": seq_embeddings[indices],
         "seq_mask": seq_mask[indices],
         "struc_features": struc_array[indices],
-        "labels": label_resampled.astype(int),
+        "labels": np.asarray(labels)[indices].astype(int),
         "indices": indices,
     }
 
 
-def _sn_sp_mcc_for_threshold(y_true, y_prob, thr):
-    y_pred = (y_prob >= thr).astype(int)
-    pos = y_true == 1
-    neg = ~pos
-    tp = int(np.sum(y_pred[pos] == 1))
-    fn = int(np.sum(y_pred[pos] == 0))
-    tn = int(np.sum(y_pred[neg] == 0))
-    fp = int(np.sum(y_pred[neg] == 1))
-    sn = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    sp = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    denom = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
-    mcc = 0.0 if denom == 0 else (tp * tn - fp * fn) / np.sqrt(denom)
-    return sn, sp, mcc
+def _validate_split(split):
+    labels = np.asarray(split["labels"])
+    if labels.ndim != 1 or not np.isin(labels, [0, 1]).all():
+        raise ValueError("Expected one-dimensional binary labels")
+    for key in ("seq_pooled", "seq_embeddings", "seq_mask", "struc_features"):
+        if len(split[key]) != len(labels):
+            raise ValueError(f"Sample count mismatch in {key}")
+    if split["seq_embeddings"].shape[:2] != split["seq_mask"].shape:
+        raise ValueError("Sequence embedding/mask shape mismatch")
 
 
-def _choose_threshold_by_targets(y_true, y_prob, sn_target, sp_target, w_sn=1.0, w_sp=1.0, topk=TOPK_BY_COST):
-    fpr, tpr, thresholds = roc_curve(y_true, y_prob, pos_label=1)
-    thresholds = np.clip(thresholds, 0.0, 1.0)
-    costs = []
-    for i, thr in enumerate(thresholds):
-        sn = tpr[i]
-        sp = 1.0 - fpr[i]
-        cost = w_sn * abs(sn - sn_target) + w_sp * abs(sp - sp_target)
-        costs.append((cost, float(thr), sn, sp))
-    costs.sort(key=lambda x: x[0])
-    candidates = costs[: max(1, min(topk, len(costs)))]
-
-    best = None
-    best_mcc = -1.0
-    for _, thr, _, _ in candidates:
-        sn, sp, mcc = _sn_sp_mcc_for_threshold(y_true, y_prob, thr)
-        if mcc > best_mcc:
-            best_mcc = mcc
-            best = (thr, sn, sp, mcc)
-    return best
-
-
-def _choose_threshold_by_mcc(y_true, y_prob):
-    fpr, tpr, thresholds = roc_curve(y_true, y_prob, pos_label=1)
-    del fpr, tpr
-    thresholds = np.clip(thresholds, 0.0, 1.0)
-    best = (0.5, 0.0, 0.0, -1.0)
-    for thr in thresholds:
-        sn, sp, mcc = _sn_sp_mcc_for_threshold(y_true, y_prob, thr)
-        if mcc > best[3]:
-            best = (float(thr), sn, sp, mcc)
-    return best
+def _resample_training_fold(split, train_indices):
+    """KSU indices are LOCAL to this subset; map them back for audit logs."""
+    sampled = _deterministic_ksu(
+        split["seq_pooled"][train_indices],
+        split["seq_embeddings"][train_indices],
+        split["seq_mask"][train_indices],
+        split["struc_features"][train_indices],
+        split["labels"][train_indices],
+    )
+    sampled["original_indices"] = np.asarray(train_indices)[sampled["indices"]]
+    return sampled
 
 
 def _eval_with_metrics(y_true_raw, y_prob, threshold=0.5):
@@ -288,7 +267,7 @@ def _build_selector(input_dim):
 
 def PreRBP_10fold_and_test(file_name, kmer, seq_kernel, struc_kernel, batch_size=32, epochs=30, n_splits=10):
     results_dir = _ensure_dir(PROJECT_ROOT / "results")
-    run_tag = f"{file_name}_GENALM_SG{SG_TARGET_DIM}_TxCA_k{kmer}_seq{seq_kernel}_struc{struc_kernel}"
+    run_tag = f"{PROTOCOL_VERSION}_{file_name}_GENALM_SG{SG_TARGET_DIM}_TxCA_k{kmer}_seq{seq_kernel}_struc{struc_kernel}"
     cv_dir = _ensure_dir(results_dir / f"{run_tag}_cv")
     test_dir = _ensure_dir(results_dir / f"{run_tag}_test")
 
@@ -296,70 +275,57 @@ def PreRBP_10fold_and_test(file_name, kmer, seq_kernel, struc_kernel, batch_size
     test_split = _load_test_data(file_name, kmer, seq_kernel, struc_kernel)
     _align_train_test_seq_lengths(train_split, test_split)
 
-    resampled_train = _deterministic_ksu(
-        train_split["seq_pooled"],
-        train_split["seq_embeddings"],
-        train_split["seq_mask"],
-        train_split["struc_features"],
-        train_split["labels"],
-    )
-
-    stats_before = _label_stats(train_split["labels"])
-    stats_after = _label_stats(resampled_train["labels"])
-
-    print("\n[Sampling Stats] BEFORE resampling:")
-    print(
-        f"  total={stats_before['total']}, pos={stats_before['pos']} ({stats_before['pos_pct']:.2f}%), "
-        f"neg={stats_before['neg']} ({stats_before['neg_pct']:.2f}%), ratio={stats_before['ratio_str']} "
-        f"(Neg/Pos={stats_before['imbalance_ratio_neg_over_pos']:.3f})"
-    )
-    print("[Sampling Stats] AFTER resampling (KSU):")
-    print(
-        f"  total={stats_after['total']}, pos={stats_after['pos']} ({stats_after['pos_pct']:.2f}%), "
-        f"neg={stats_after['neg']} ({stats_after['neg_pct']:.2f}%), ratio={stats_after['ratio_str']} "
-        f"(Neg/Pos={stats_after['imbalance_ratio_neg_over_pos']:.3f})\n"
-    )
-
-    with open(results_dir / f"{run_tag}_sampling_stats.json", "w", encoding="utf-8") as fjs:
-        json.dump({"before": stats_before, "after": stats_after}, fjs, ensure_ascii=False, indent=2)
+    _validate_split(train_split)
+    _validate_split(test_split)
+    counts = np.bincount(train_split["labels"].astype(int), minlength=2)
+    if n_splits < 2 or counts.min() < n_splits:
+        raise ValueError("Each class must have at least n_splits original training samples")
 
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=SEED)
     mean_fpr = np.linspace(0, 1, 100)
     fold_tprs, fold_aucs, fold_metrics = [], [], []
-    best_threshold_from_cv = 0.5
+    evaluation_threshold = CLASSIFICATION_THRESHOLD
 
-    compared_path = results_dir / f"GENALM_SG{SG_TARGET_DIM}_TxCA_compared.txt"
+    compared_path = results_dir / f"{PROTOCOL_VERSION}_GENALM_SG{SG_TARGET_DIM}_TxCA_compared.txt"
+    # Per-run fold logs must not accumulate stale folds when rerun.
+    (cv_dir / "per_fold_metrics.txt").write_text("", encoding="utf-8")
+    oof_probabilities = np.full(len(train_split["labels"]), np.nan)
+    oof_fold = np.full(len(train_split["labels"]), -1, dtype=int)
 
-    use_targets = file_name in PAPER_SN_SP_TARGETS
-    if use_targets:
-        sn_t = PAPER_SN_SP_TARGETS[file_name]["SN"]
-        sp_t = PAPER_SN_SP_TARGETS[file_name]["SP"]
-        print(
-            f"[Thresholding] Use paper targets for '{file_name}': "
-            f"SN={sn_t}, SP={sp_t}, weights SN:{TARGET_WEIGHT_SN}, SP:{TARGET_WEIGHT_SP}"
-        )
-    else:
-        print("[Thresholding] Paper targets not found -> fallback to max MCC threshold.")
+    print(f"[Thresholding] Predeclared fixed threshold: {CLASSIFICATION_THRESHOLD}")
+    seq_pooled = train_split["seq_pooled"]
+    labels = train_split["labels"]
 
-    seq_embeddings = resampled_train["seq_embeddings"]
-    seq_pooled = resampled_train["seq_pooled"]
-    struc_features = resampled_train["struc_features"]
-    y_resampled = resampled_train["labels"]
-
-    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(seq_pooled, y_resampled), start=1):
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(seq_pooled, labels), start=1):
         print(f"\n===== Fold {fold_idx}/{n_splits} =====")
         tf.keras.backend.clear_session()
         tf.keras.utils.set_random_seed(SEED)
 
-        x_tr_pooled = seq_pooled[train_idx]
-        x_tr_seq_full = seq_embeddings[train_idx]
-        x_tr_str = struc_features[train_idx].astype(np.float32)
-        y_tr_raw = y_resampled[train_idx]
+        sampled = _resample_training_fold(train_split, train_idx)
+        original_indices = sampled["original_indices"]
+        if np.intersect1d(original_indices, val_idx).size:
+            raise RuntimeError("Training/validation sample overlap")
+        np.savez(
+            cv_dir / f"fold{fold_idx}_indices.npz",
+            train_indices=train_idx,
+            ksu_local_indices=sampled["indices"],
+            retained_original_indices=original_indices,
+            validation_indices=val_idx,
+        )
+        with open(cv_dir / f"fold{fold_idx}_sampling_stats.json", "w", encoding="utf-8") as fs:
+            json.dump({
+                "before": _label_stats(labels[train_idx]),
+                "after": _label_stats(sampled["labels"]),
+                "validation": _label_stats(labels[val_idx]),
+            }, fs, indent=2)
+        x_tr_pooled = sampled["seq_pooled"]
+        x_tr_seq_full = sampled["seq_embeddings"]
+        x_tr_str = sampled["struc_features"].astype(np.float32)
+        y_tr_raw = sampled["labels"]
 
-        x_val_pooled = seq_pooled[val_idx]
-        x_val_seq_full = seq_embeddings[val_idx]
-        x_val_str = struc_features[val_idx].astype(np.float32)
-        y_val_raw = y_resampled[val_idx]
+        x_val_seq_full = train_split["seq_embeddings"][val_idx]
+        x_val_str = train_split["struc_features"][val_idx].astype(np.float32)
+        y_val_raw = labels[val_idx]
 
         selector = _build_selector(x_tr_pooled.shape[1])
         selector.fit(x_tr_pooled, y_tr_raw)
@@ -378,7 +344,6 @@ def PreRBP_10fold_and_test(file_name, kmer, seq_kernel, struc_kernel, batch_size
             )
 
         y_tr = to_categorical(y_tr_raw, num_classes=2)
-        y_val = to_categorical(y_val_raw, num_classes=2)
 
         model = build_transformer_cross_attention_model(
             seq_len=x_tr_seq.shape[1],
@@ -403,7 +368,6 @@ def PreRBP_10fold_and_test(file_name, kmer, seq_kernel, struc_kernel, batch_size
             y=y_tr,
             batch_size=batch_size,
             epochs=epochs,
-            validation_data=([x_val_seq, x_val_str], y_val),
             verbose=1,
             shuffle=False,
         )
@@ -412,31 +376,14 @@ def PreRBP_10fold_and_test(file_name, kmer, seq_kernel, struc_kernel, batch_size
 
         prob_val = model.predict([x_val_seq, x_val_str], verbose=0)
         y_prob_val = prob_val[:, -1]
+        oof_probabilities[val_idx] = y_prob_val
+        oof_fold[val_idx] = fold_idx
 
         fpr, tpr, _ = roc_curve(y_val_raw, y_prob_val, pos_label=1)
         auc_roc = roc_auc_score(y_val_raw, y_prob_val)
 
-        if use_targets:
-            thr_best, sn_at_thr, sp_at_thr, mcc_at_thr = _choose_threshold_by_targets(
-                y_val_raw,
-                y_prob_val,
-                sn_t,
-                sp_t,
-                w_sn=TARGET_WEIGHT_SN,
-                w_sp=TARGET_WEIGHT_SP,
-            )
-            print(
-                f"[Fold {fold_idx}] chosen thr by targets -> {thr_best:.4f} "
-                f"(SN={sn_at_thr:.4f}, SP={sp_at_thr:.4f}, MCC={mcc_at_thr:.4f})"
-            )
-        else:
-            thr_best, sn_at_thr, sp_at_thr, mcc_at_thr = _choose_threshold_by_mcc(y_val_raw, y_prob_val)
-            print(
-                f"[Fold {fold_idx}] chosen thr by max MCC -> {thr_best:.4f} "
-                f"(SN={sn_at_thr:.4f}, SP={sp_at_thr:.4f}, MCC={mcc_at_thr:.4f})"
-            )
-
-        best_threshold_from_cv = float(thr_best)
+        # Outer validation labels are used only for reporting, never selection.
+        thr_best = CLASSIFICATION_THRESHOLD
         tpr_interp = np.interp(mean_fpr, fpr, tpr)
         tpr_interp[0] = 0.0
         fold_tprs.append(tpr_interp)
@@ -483,10 +430,20 @@ def PreRBP_10fold_and_test(file_name, kmer, seq_kernel, struc_kernel, batch_size
             }
         )
 
-        del x_val_pooled
 
         if STOP_AFTER_FIRST_FOLD:
             break
+
+    np.savez(
+        cv_dir / "oof_predictions.npz",
+        original_indices=np.arange(len(labels)),
+        labels=labels,
+        probabilities=oof_probabilities,
+        fold=oof_fold,
+        threshold=CLASSIFICATION_THRESHOLD,
+    )
+    if not STOP_AFTER_FIRST_FOLD and np.any(oof_fold < 1):
+        raise RuntimeError("Incomplete outer validation coverage")
 
     roc_mean_path, mean_auc, std_auc = _plot_and_save_mean_roc(
         cv_dir,
@@ -510,7 +467,7 @@ def PreRBP_10fold_and_test(file_name, kmer, seq_kernel, struc_kernel, batch_size
     mean_F1, std_F1 = _mean_std("F1")
     mean_thr, std_thr = _mean_std("thr")
 
-    best_threshold_from_cv = float(mean_thr)
+    evaluation_threshold = CLASSIFICATION_THRESHOLD
     print("\n==== CV Summary ====")
     print(f"P: {mean_P:.4f} +/- {std_P:.4f}")
     print(f"SN: {mean_SN:.4f} +/- {std_SN:.4f}")
@@ -544,6 +501,10 @@ def PreRBP_10fold_and_test(file_name, kmer, seq_kernel, struc_kernel, batch_size
         writer.writerows(fold_metrics)
 
     cv_json = {
+        "protocol": PROTOCOL_VERSION,
+        "threshold_strategy": "predeclared_fixed",
+        "classification_threshold": CLASSIFICATION_THRESHOLD,
+        "completed_folds": len(fold_metrics),
         "seed": SEED,
         "n_splits": n_splits,
         "only_first_fold": STOP_AFTER_FIRST_FOLD,
@@ -598,6 +559,39 @@ def PreRBP_10fold_and_test(file_name, kmer, seq_kernel, struc_kernel, batch_size
     print("\n===== Independent Test (train on ALL resampled training data) =====")
     tf.keras.backend.clear_session()
     tf.keras.utils.set_random_seed(SEED)
+
+    resampled_train = _deterministic_ksu(
+        train_split["seq_pooled"],
+        train_split["seq_embeddings"],
+        train_split["seq_mask"],
+        train_split["struc_features"],
+        train_split["labels"],
+    )
+
+    stats_before = _label_stats(train_split["labels"])
+    stats_after = _label_stats(resampled_train["labels"])
+
+    print("\n[Sampling Stats] BEFORE resampling:")
+    print(
+        f"  total={stats_before['total']}, pos={stats_before['pos']} ({stats_before['pos_pct']:.2f}%), "
+        f"neg={stats_before['neg']} ({stats_before['neg_pct']:.2f}%), ratio={stats_before['ratio_str']} "
+        f"(Neg/Pos={stats_before['imbalance_ratio_neg_over_pos']:.3f})"
+    )
+    print("[Sampling Stats] AFTER resampling (KSU):")
+    print(
+        f"  total={stats_after['total']}, pos={stats_after['pos']} ({stats_after['pos_pct']:.2f}%), "
+        f"neg={stats_after['neg']} ({stats_after['neg_pct']:.2f}%), ratio={stats_after['ratio_str']} "
+        f"(Neg/Pos={stats_after['imbalance_ratio_neg_over_pos']:.3f})\n"
+    )
+
+    with open(results_dir / f"{run_tag}_sampling_stats.json", "w", encoding="utf-8") as fjs:
+        json.dump({"before": stats_before, "after": stats_after}, fjs, ensure_ascii=False, indent=2)
+
+    seq_embeddings = resampled_train["seq_embeddings"]
+    seq_pooled = resampled_train["seq_pooled"]
+    struc_features = resampled_train["struc_features"]
+    y_resampled = resampled_train["labels"]
+    np.save(test_dir / "final_ksu_original_indices.npy", resampled_train["indices"])
 
     final_selector = _build_selector(seq_pooled.shape[1])
     final_selector.fit(seq_pooled, y_resampled)
@@ -656,13 +650,13 @@ def PreRBP_10fold_and_test(file_name, kmer, seq_kernel, struc_kernel, batch_size
     p, sn, sp, acc, ba, auc_v, mcc, f1 = _eval_with_metrics(
         test_y_raw,
         y_prob_test,
-        threshold=best_threshold_from_cv,
+        threshold=evaluation_threshold,
     )
 
     print(
         f"[TEST] {run_tag}\tP:{p:.4f}\tSN:{sn:.4f}\tSP:{sp:.4f}\tACC:{acc:.4f}\t"
         f"balanced_acc:{ba:.4f}\tAUC:{auc_v:.4f}\tMCC:{mcc:.4f}\tF1:{f1:.4f}\t"
-        f"thr(CV):{best_threshold_from_cv:.4f}"
+        f"thr(fixed):{evaluation_threshold:.4f}"
     )
     sys.stdout.flush()
 
@@ -670,7 +664,7 @@ def PreRBP_10fold_and_test(file_name, kmer, seq_kernel, struc_kernel, batch_size
         fw.write(
             f"{run_tag}\tP:{p}\tSN:{sn}\tSP:{sp}\tACC:{acc}\t"
             f"balanced_acc:{ba}\tAUC:{auc_v}\tMCC:{mcc}\tF1:{f1}\t"
-            f"thr(CV):{best_threshold_from_cv}\n"
+            f"thr(fixed):{evaluation_threshold}\n"
         )
 
     fpr_t, tpr_t, _ = roc_curve(test_y_raw, y_prob_test, pos_label=1)
@@ -704,7 +698,7 @@ def PreRBP_10fold_and_test(file_name, kmer, seq_kernel, struc_kernel, batch_size
             "MCC": float(mcc),
             "F1": float(f1),
             "roc_png": str(test_roc_path),
-            "thr_from_cv": float(best_threshold_from_cv),
+            "fixed_threshold": float(evaluation_threshold),
         },
         "sequence_encoder": {
             "name": SEQ_MODEL_NAME,
@@ -739,7 +733,7 @@ def PreRBP_10fold_and_test(file_name, kmer, seq_kernel, struc_kernel, batch_size
         fw.write(
             f"[TEST] {run_tag}\tP:{p:.4f}\tSN:{sn:.4f}\tSP:{sp:.4f}\tACC:{acc:.4f}\t"
             f"balanced_acc:{ba:.4f}\tAUC:{auc_v:.4f}\tMCC:{mcc:.4f}\tF1:{f1:.4f}\t"
-            f"thr(CV):{best_threshold_from_cv:.4f}\n"
+            f"thr(fixed):{evaluation_threshold:.4f}\n"
         )
 
 
